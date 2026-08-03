@@ -51,6 +51,7 @@ func Dial(rawURL string) (core.Producer, error) {
 			break
 		}
 		lastErr = err
+		Logger.Warn().Err(err).Int("attempt", attempt+1).Str("device", deviceID).Msg("nest: dial auth failed, retrying")
 		if attempt < maxRetries-1 {
 			time.Sleep(retryDelay)
 			retryDelay *= 2 // exponential backoff
@@ -58,6 +59,7 @@ func Dial(rawURL string) (core.Producer, error) {
 	}
 
 	if nestAPI == nil {
+		Logger.Error().Err(lastErr).Str("device", deviceID).Msg("nest: dial auth failed, giving up")
 		return nil, lastErr
 	}
 
@@ -136,11 +138,14 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 		answer, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
 		if err != nil {
 			lastErr = err
+			Logger.Warn().Err(err).Int("attempt", attempt+1).Str("device", deviceID).
+				Msg("nest: exchange sdp failed, retrying")
 			if attempt < maxRetries-1 {
 				time.Sleep(retryDelay)
 				retryDelay *= 2
 				continue
 			}
+			Logger.Error().Err(err).Str("device", deviceID).Msg("nest: exchange sdp failed, giving up")
 			return nil, err
 		}
 
@@ -187,8 +192,10 @@ func (c *RTSPClient) Start() error {
 }
 
 func (c *RTSPClient) Stop() error {
-	c.api.StopRTSPStream()
+	// Stop the extend loop first and wait for it to fully exit - it mutates
+	// the same StreamToken/StreamExtensionToken fields StopRTSPStream reads.
 	c.api.StopExtendStreamTimer()
+	c.api.StopRTSPStream()
 	return c.conn.Stop()
 }
 

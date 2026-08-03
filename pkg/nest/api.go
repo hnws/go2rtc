@@ -4,12 +4,25 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog"
 )
+
+// Logger is disabled by default so pkg/nest stays silent when used outside
+// go2rtc. internal/nest wires it up to app.GetLogger("nest") at Init.
+var Logger = zerolog.Nop()
+
+// httpTimeout was previously written as `time.Second * 5000` (~83 minutes)
+// everywhere in this file - almost certainly a typo for 5 seconds. A single
+// hung request under the old value could stall the extend loop for over an
+// hour, since ExtendStream/refreshToken run synchronously inside it.
+const httpTimeout = 5 * time.Second
 
 type API struct {
 	Token     string
@@ -30,6 +43,7 @@ type API struct {
 
 	extendTimer *time.Timer
 	extendStop  chan struct{}
+	extendDone  chan struct{}
 }
 
 type Auth struct {
@@ -57,8 +71,11 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	// multiple cameras sharing one instance overwrite each other's session
 	// and only the last one gets extended.
 	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
+		Logger.Debug().Time("expires_at", api.ExpiresAt).Msg("nest: reuse cached oauth token")
 		return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
 	}
+
+	Logger.Debug().Msg("nest: requesting oauth token")
 
 	data := url.Values{
 		"grant_type":    []string{"refresh_token"},
@@ -67,14 +84,17 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		"refresh_token": []string{refreshToken},
 	}
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
 	if err != nil {
+		Logger.Warn().Err(err).Msg("nest: oauth token request failed")
 		return nil, err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(res.Body)
+		Logger.Warn().Int("status", res.StatusCode).Str("body", string(b)).Msg("nest: oauth token request rejected")
 		return nil, errors.New("nest: wrong status: " + res.Status)
 	}
 
@@ -86,6 +106,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	}
 
 	if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
+		Logger.Warn().Err(err).Msg("nest: oauth token response decode failed")
 		return nil, err
 	}
 
@@ -93,6 +114,8 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		Token:     resv.AccessToken,
 		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
 	}
+
+	Logger.Debug().Time("expires_at", api.ExpiresAt).Msg("nest: oauth token obtained")
 
 	cache[key] = api
 
@@ -108,7 +131,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -156,6 +179,14 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 	return devices, nil
 }
 
+// sdpMaxRetries/sdpRetryDelay tune the 409/429/401 backoff below - vars
+// (not consts) so tests can shrink them instead of running at real-world
+// timescales (30s, 60s, 120s in production).
+var (
+	sdpMaxRetries = 3
+	sdpRetryDelay = 30 * time.Second
+)
+
 func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 	var reqv struct {
 		Command string `json:"command"`
@@ -174,8 +205,8 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
 		projectID + "/devices/" + deviceID + ":executeCommand"
 
-	maxRetries := 3
-	retryDelay := time.Second * 30
+	maxRetries := sdpMaxRetries
+	retryDelay := sdpRetryDelay
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
@@ -185,18 +216,22 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: time.Second * 5000}
+		client := &http.Client{Timeout: httpTimeout}
 		res, err := client.Do(req)
 		if err != nil {
+			Logger.Warn().Err(err).Str("device", deviceID).Int("attempt", attempt+1).Msg("nest: exchange sdp request failed")
 			return "", err
 		}
 
 		// Handle 409 (Conflict), 429 (Too Many Requests), and 401 (Unauthorized)
 		if res.StatusCode == 409 || res.StatusCode == 429 || res.StatusCode == 401 {
 			res.Body.Close()
+			Logger.Warn().Int("status", res.StatusCode).Str("device", deviceID).Int("attempt", attempt+1).
+				Msg("nest: exchange sdp rejected, retrying")
 			if attempt < maxRetries-1 {
 				// Get new token from Google
 				if err := a.refreshToken(); err != nil {
+					Logger.Warn().Err(err).Msg("nest: token refresh before retry failed")
 					return "", err
 				}
 				time.Sleep(retryDelay)
@@ -208,6 +243,8 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		defer res.Body.Close()
 
 		if res.StatusCode != 200 {
+			b, _ := io.ReadAll(res.Body)
+			Logger.Warn().Int("status", res.StatusCode).Str("device", deviceID).Str("body", string(b)).Msg("nest: exchange sdp failed")
 			return "", errors.New("nest: wrong status: " + res.Status)
 		}
 
@@ -228,6 +265,9 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		a.StreamSessionID = resv.Results.MediaSessionID
 		a.StreamExpiresAt = resv.Results.ExpiresAt
 
+		Logger.Debug().Str("device", deviceID).Time("expires_at", a.StreamExpiresAt).
+			Msg("nest: webrtc session established")
+
 		return resv.Results.Answer, nil
 	}
 
@@ -238,6 +278,8 @@ func (a *API) refreshToken() error {
 	if a.key == "" {
 		return errors.New("nest: unable to find cached credentials")
 	}
+
+	Logger.Debug().Msg("nest: refreshing oauth token")
 
 	// Parse credentials from the cache key
 	parts := strings.SplitN(a.key, ":", 3)
@@ -291,14 +333,18 @@ func (a *API) ExtendStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
+		Logger.Warn().Err(err).Str("device", a.StreamDeviceID).Msg("nest: extend stream request failed")
 		return err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(res.Body)
+		Logger.Warn().Int("status", res.StatusCode).Str("device", a.StreamDeviceID).Str("body", string(b)).
+			Msg("nest: extend stream rejected")
 		return errors.New("nest: wrong status: " + res.Status)
 	}
 
@@ -344,13 +390,17 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
+		Logger.Warn().Err(err).Str("device", deviceID).Msg("nest: generate rtsp stream request failed")
 		return "", err
 	}
 
 	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(res.Body)
+		Logger.Warn().Int("status", res.StatusCode).Str("device", deviceID).Str("body", string(b)).
+			Msg("nest: generate rtsp stream rejected")
 		return "", errors.New("nest: wrong status: " + res.Status)
 	}
 
@@ -376,6 +426,9 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 	a.StreamToken = resv.Results.StreamToken
 	a.StreamExtensionToken = resv.Results.StreamExtensionToken
 	a.StreamExpiresAt = resv.Results.ExpiresAt
+
+	Logger.Debug().Str("device", deviceID).Time("expires_at", a.StreamExpiresAt).
+		Msg("nest: rtsp session established")
 
 	return resv.Results.StreamURLs["rtspUrl"], nil
 }
@@ -408,13 +461,15 @@ func (a *API) StopRTSPStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: httpTimeout}
 	res, err := client.Do(req)
 	if err != nil {
+		Logger.Warn().Err(err).Str("device", a.StreamDeviceID).Msg("nest: stop rtsp stream request failed")
 		return err
 	}
 
 	if res.StatusCode != 200 {
+		Logger.Warn().Int("status", res.StatusCode).Str("device", a.StreamDeviceID).Msg("nest: stop rtsp stream rejected")
 		return errors.New("nest: wrong status: " + res.Status)
 	}
 
@@ -460,6 +515,19 @@ type Device struct {
 	} `json:"parentRelations"`
 }
 
+// Tuning knobs for the extend loop below, kept as vars (not consts) so
+// tests can shrink them instead of running at real-world timescales.
+var (
+	// extendMinDelay is a floor on the re-arm delay so a bogus or
+	// already-passed StreamExpiresAt can't turn the timer into a hot loop.
+	extendMinDelay = 30 * time.Second
+	// extendRetryDelay is how soon a failed extend attempt is retried.
+	// Transient errors (network blips, Google 5xx, OAuth timeouts) should
+	// not be treated as fatal - only give up after several attempts.
+	extendRetryDelay = 15 * time.Second
+	extendMaxRetries = 10
+)
+
 func (a *API) StartExtendStreamTimer() {
 	if a.extendTimer != nil {
 		return
@@ -467,25 +535,62 @@ func (a *API) StartExtendStreamTimer() {
 
 	// Google expires sessions after ~5 minutes; each successful extension
 	// returns a new expiresAt, so keep extending until the stream stops.
-	timer := time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
+	timer := time.NewTimer(extendDelay(a.StreamExpiresAt))
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	a.extendTimer = timer
 	a.extendStop = stop
+	a.extendDone = done
+
+	Logger.Debug().Str("device", a.StreamDeviceID).Time("expires_at", a.StreamExpiresAt).
+		Msg("nest: extend timer started")
 
 	go func() {
+		defer close(done)
+
+		failures := 0
+
 		for {
 			select {
 			case <-timer.C:
 				// The OAuth token lives ~1 hour, sessions can live longer
 				if time.Now().After(a.ExpiresAt.Add(-30 * time.Second)) {
 					if err := a.refreshToken(); err != nil {
-						return
+						failures++
+						Logger.Warn().Err(err).Str("device", a.StreamDeviceID).Int("attempt", failures).
+							Msg("nest: refresh oauth token before extend failed, retrying")
+
+						if failures >= extendMaxRetries {
+							Logger.Error().Str("device", a.StreamDeviceID).
+								Msg("nest: giving up on extending stream after repeated token refresh failures, stream will disconnect")
+							return
+						}
+
+						timer.Reset(extendRetryDelay)
+						continue
 					}
 				}
+
 				if err := a.ExtendStream(); err != nil {
-					return
+					failures++
+					Logger.Warn().Err(err).Str("device", a.StreamDeviceID).Int("attempt", failures).
+						Msg("nest: extend stream failed, retrying")
+
+					if failures >= extendMaxRetries {
+						Logger.Error().Str("device", a.StreamDeviceID).
+							Msg("nest: giving up on extending stream after repeated failures, stream will disconnect")
+						return
+					}
+
+					timer.Reset(extendRetryDelay)
+					continue
 				}
-				timer.Reset(time.Until(a.StreamExpiresAt) - time.Minute)
+
+				failures = 0
+				Logger.Debug().Str("device", a.StreamDeviceID).Time("expires_at", a.StreamExpiresAt).
+					Msg("nest: extend stream ok")
+
+				timer.Reset(extendDelay(a.StreamExpiresAt))
 			case <-stop:
 				return
 			}
@@ -493,6 +598,25 @@ func (a *API) StartExtendStreamTimer() {
 	}()
 }
 
+// extendDelay returns how long to wait before the next extend attempt,
+// never less than extendMinDelay - StreamExpiresAt can be zero/stale on the
+// first arm or briefly inconsistent, and without a floor that turns the
+// timer into a hot loop hammering the Google API.
+func extendDelay(expiresAt time.Time) time.Duration {
+	// Compare before subtracting time.Minute: time.Until on a zero/far-past
+	// expiresAt clamps to the minimum representable Duration, and
+	// subtracting from that would overflow back around to a huge positive
+	// number instead of staying negative.
+	if d := time.Until(expiresAt); d > extendMinDelay+time.Minute {
+		return d - time.Minute
+	}
+	return extendMinDelay
+}
+
+// StopExtendStreamTimer stops the extend loop and waits for its goroutine to
+// exit before returning, so callers can safely read/mutate the Stream*
+// fields (e.g. to send a final StopRtspStream) right after this returns
+// without racing the loop's last in-flight ExtendStream call.
 func (a *API) StopExtendStreamTimer() {
 	if a.extendTimer != nil {
 		a.extendTimer.Stop()
@@ -502,4 +626,10 @@ func (a *API) StopExtendStreamTimer() {
 		close(a.extendStop)
 		a.extendStop = nil
 	}
+	if a.extendDone != nil {
+		<-a.extendDone
+		a.extendDone = nil
+	}
+
+	Logger.Debug().Str("device", a.StreamDeviceID).Msg("nest: extend timer stopped")
 }
