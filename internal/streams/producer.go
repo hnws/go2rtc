@@ -31,9 +31,48 @@ type Producer struct {
 	receivers []*core.Receiver
 	senders   []*core.Receiver
 
-	state    state
-	mu       sync.Mutex
-	workerID int
+	state     state
+	mu        sync.Mutex
+	workerID  int
+	failCount int
+}
+
+// First 4 consecutive failures stay at a flat 8s for transient blips. From
+// the 5th on, back off exponentially (8s, 16s, 32s, ...) capped at 15
+// minutes - a source failing this long is likely hitting a sustained
+// external condition (e.g. an API rate limit) that retrying every few
+// seconds forever won't clear any faster, and for rate-limited sources only
+// prolongs the throttle window.
+const (
+	fastRetries = 4
+	backoffBase = 8 * time.Second
+	backoffCap  = 15 * time.Minute
+
+	// minConnLifetime is how long a connection has to survive before it
+	// counts as a real success and resets the failure streak. Some sources
+	// (e.g. a nest camera colliding with a still-active session on Google's
+	// side) will let GetProducer succeed and then die again within seconds -
+	// without this, that counts as "connected" and the failure streak (and
+	// its backoff) never engages, so the reconnect loop hammers the source
+	// as fast as it can accept a new attempt.
+	minConnLifetime = 10 * time.Second
+)
+
+func backoffDelay(failCount int) time.Duration {
+	if failCount < fastRetries {
+		return backoffBase
+	}
+
+	shift := failCount - fastRetries
+	if shift > 12 { // backoffBase << 12 is already far past backoffCap
+		shift = 12
+	}
+
+	timeout := backoffBase << uint(shift)
+	if timeout > backoffCap {
+		timeout = backoffCap
+	}
+	return timeout
 }
 
 const SourceTemplate = "{input}"
@@ -158,6 +197,8 @@ func (p *Producer) start() {
 }
 
 func (p *Producer) worker(conn core.Producer, workerID int) {
+	connStart := time.Now()
+
 	if err := conn.Start(); err != nil {
 		p.mu.Lock()
 		closed := p.workerID != workerID
@@ -170,36 +211,48 @@ func (p *Producer) worker(conn core.Producer, workerID int) {
 		log.Warn().Err(err).Str("url", p.url).Caller().Send()
 	}
 
-	p.reconnect(workerID, 0)
+	p.armReconnect(workerID, time.Since(connStart))
 }
 
-func (p *Producer) reconnect(workerID, retry int) {
+// armReconnect decides the delay before the next reconnect attempt and
+// schedules it. lived is how long the just-ended connection survived (zero
+// if it never connected at all) - anything shorter than minConnLifetime
+// counts as a failure and backs off; anything longer resets the streak.
+func (p *Producer) armReconnect(workerID int, lived time.Duration) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if lived >= minConnLifetime {
+		p.failCount = 0
+	}
+	failCount := p.failCount
+	p.failCount++
+	p.mu.Unlock()
+
+	delay := time.Duration(0)
+	if lived < minConnLifetime {
+		delay = backoffDelay(failCount)
+	}
+
+	time.AfterFunc(delay, func() {
+		p.reconnect(workerID)
+	})
+}
+
+func (p *Producer) reconnect(workerID int) {
+	p.mu.Lock()
 
 	if p.workerID != workerID {
+		p.mu.Unlock()
 		log.Trace().Msgf("[streams] stop reconnect url=%s", p.url)
 		return
 	}
 
-	log.Debug().Msgf("[streams] retry=%d to url=%s", retry, p.url)
+	log.Debug().Msgf("[streams] retry=%d to url=%s", p.failCount, p.url)
 
 	conn, err := GetProducer(p.url)
 	if err != nil {
+		p.mu.Unlock()
 		log.Debug().Msgf("[streams] producer=%s", err)
-
-		timeout := time.Minute
-		if retry < 5 {
-			timeout = time.Second
-		} else if retry < 10 {
-			timeout = time.Second * 5
-		} else if retry < 20 {
-			timeout = time.Second * 10
-		}
-
-		time.AfterFunc(timeout, func() {
-			p.reconnect(workerID, retry+1)
-		})
+		p.armReconnect(workerID, 0)
 		return
 	}
 
@@ -239,6 +292,8 @@ func (p *Producer) reconnect(workerID, retry int) {
 	// swap connections
 	p.conn = conn
 
+	p.mu.Unlock()
+
 	go p.worker(conn, workerID)
 }
 
@@ -256,6 +311,10 @@ func (p *Producer) stop() {
 	case stateStart:
 		p.workerID++
 	}
+
+	// an explicit stop isn't a failure - don't let a stale streak carry a
+	// backoff delay into the next time this producer is started
+	p.failCount = 0
 
 	log.Debug().Msgf("[streams] stop producer url=%s", p.url)
 

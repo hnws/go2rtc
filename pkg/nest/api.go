@@ -481,6 +481,60 @@ func (a *API) StopRTSPStream() error {
 	return nil
 }
 
+// StopWebRTCStream releases the WebRTC media session on Google's side.
+// Without this, a session left dangling after a producer disconnect blocks
+// the next GenerateWebRtcStream call for the same device with 409/429 until
+// the old session naturally expires (~5 minutes).
+func (a *API) StopWebRTCStream() error {
+	if a.StreamProjectID == "" || a.StreamDeviceID == "" {
+		return errors.New("nest: tried to stop webrtc stream without a project or device ID")
+	}
+
+	var reqv struct {
+		Command string `json:"command"`
+		Params  struct {
+			MediaSessionID string `json:"mediaSessionId"`
+		} `json:"params"`
+	}
+	reqv.Command = "sdm.devices.commands.CameraLiveStream.StopWebRtcStream"
+	reqv.Params.MediaSessionID = a.StreamSessionID
+
+	b, err := json.Marshal(reqv)
+	if err != nil {
+		return err
+	}
+
+	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+
+	client := &http.Client{Timeout: httpTimeout}
+	res, err := client.Do(req)
+	if err != nil {
+		Logger.Warn().Err(err).Str("device", a.StreamDeviceID).Msg("nest: stop webrtc stream request failed")
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		Logger.Warn().Int("status", res.StatusCode).Str("device", a.StreamDeviceID).Msg("nest: stop webrtc stream rejected")
+		return errors.New("nest: wrong status: " + res.Status)
+	}
+
+	Logger.Debug().Str("device", a.StreamDeviceID).Msg("nest: webrtc session stopped")
+
+	a.StreamProjectID = ""
+	a.StreamDeviceID = ""
+	a.StreamSessionID = ""
+
+	return nil
+}
+
 type Device struct {
 	Name string `json:"name"`
 	Type string `json:"type"`

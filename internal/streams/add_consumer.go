@@ -104,6 +104,10 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 
 	s.mu.Lock()
 	s.consumers = append(s.consumers, cons)
+	if s.stopTimer != nil {
+		s.stopTimer.Stop()
+		s.stopTimer = nil
+	}
 	s.mu.Unlock()
 
 	// there may be duplicates, but that's not a problem

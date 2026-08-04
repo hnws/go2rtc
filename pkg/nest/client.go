@@ -90,7 +90,10 @@ func (c *WebRTCClient) Start() error {
 }
 
 func (c *WebRTCClient) Stop() error {
+	// Stop the extend loop first and wait for it to fully exit - it mutates
+	// the same StreamSessionID field StopWebRTCStream reads.
 	c.api.StopExtendStreamTimer()
+	c.api.StopWebRTCStream()
 	return c.conn.Stop()
 }
 

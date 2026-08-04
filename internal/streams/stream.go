@@ -4,15 +4,25 @@ import (
 	"encoding/json"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
+
+// stopGracePeriod is how long a producer is kept running with no consumers
+// before it's actually stopped. Some consumers (e.g. an NVR's RTSP client)
+// reconnect every few seconds; without a grace period, every reconnect tears
+// down and rebuilds the whole producer, which for API-backed sources (nest)
+// means a full remote session teardown+recreate on every reconnect - wasted
+// work, and for rate-limited APIs, actively harmful.
+const stopGracePeriod = 3 * time.Minute
 
 type Stream struct {
 	producers []*Producer
 	consumers []core.Consumer
 	mu        sync.Mutex
 	pending   atomic.Int32
+	stopTimer *time.Timer
 }
 
 func NewStream(source any) *Stream {
@@ -73,7 +83,27 @@ func (s *Stream) RemoveConsumer(cons core.Consumer) {
 	}
 	s.mu.Unlock()
 
-	s.stopProducers()
+	s.scheduleStopProducers()
+}
+
+// scheduleStopProducers arms stopProducers to run after stopGracePeriod,
+// replacing any timer already pending. AddConsumer cancels this if a new
+// consumer shows up before it fires.
+func (s *Stream) scheduleStopProducers() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.stopTimer != nil {
+		s.stopTimer.Stop()
+	}
+
+	s.stopTimer = time.AfterFunc(stopGracePeriod, func() {
+		s.mu.Lock()
+		s.stopTimer = nil
+		s.mu.Unlock()
+
+		s.stopProducers()
+	})
 }
 
 func (s *Stream) AddProducer(prod core.Producer) {
