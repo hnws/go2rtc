@@ -164,7 +164,10 @@ func (c *Conn) AddCandidate(candidate string) error {
 func (c *Conn) GetSenderTrack(mid string) *Track {
 	if tr := c.getTranseiver(mid); tr != nil {
 		if s := tr.Sender(); s != nil {
-			if t := s.Track().(*Track); t != nil {
+			// Track() can be nil (or a different TrackLocal implementation)
+			// during renegotiation - the single-value assertion form would
+			// panic instead of just reporting no track.
+			if t, ok := s.Track().(*Track); ok {
 				return t
 			}
 		}
