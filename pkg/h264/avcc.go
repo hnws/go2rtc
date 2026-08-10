@@ -21,7 +21,22 @@ func RepairAVCC(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 			size := int(binary.BigEndian.Uint32(packet.Payload)) + 4
 			packet.Payload = packet.Payload[size:]
 		}
-		if NALUType(packet.Payload) == NALUTypeIFrame {
+
+		// The source can start sending fresh SPS/PPS in-band (e.g. after a
+		// remote renegotiation changes resolution/profile, or when the
+		// original offer/answer never carried sprop-parameter-sets at all)
+		// without go2rtc seeing a new SDP. Keep sps/pps in sync with whatever
+		// the source last actually sent, so a later keyframe that omits its
+		// own parameter set is repaired with the current one, not a stale or
+		// empty one from the original negotiation.
+		switch NALUType(packet.Payload) {
+		case NALUTypeSPS:
+			sps = append([]byte(nil), packet.Payload[4:]...)
+			ps = JoinNALU(sps, pps)
+		case NALUTypePPS:
+			pps = append([]byte(nil), packet.Payload[4:]...)
+			ps = JoinNALU(sps, pps)
+		case NALUTypeIFrame:
 			packet.Payload = Join(ps, packet.Payload)
 		}
 		handler(packet)

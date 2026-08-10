@@ -95,6 +95,32 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 			payload = annexb.FixAnnexBInAVCC(payload)
 		}
 
+		// The source can start sending a fresh SPS/PPS in-band (e.g. after a
+		// remote renegotiation changes resolution/profile, or when the
+		// original offer/answer never carried sprop-parameter-sets at all)
+		// without go2rtc ever seeing a new SDP. Keep sps/pps in sync with
+		// whatever was last actually seen in the stream, so a later keyframe
+		// that omits its own parameter set (the "fix IFrame without SPS,PPS"
+		// case above) is repaired with the current set, not a stale or empty
+		// one from the original negotiation.
+		switch NALUType(payload) {
+		case NALUTypeSPS, NALUTypePPS:
+			updated := false
+			for _, nalu := range SplitNALU(payload) {
+				switch NALUType(nalu) {
+				case NALUTypeSPS:
+					sps = append([]byte(nil), nalu[4:]...)
+					updated = true
+				case NALUTypePPS:
+					pps = append([]byte(nil), nalu[4:]...)
+					updated = true
+				}
+			}
+			if updated {
+				ps = JoinNALU(sps, pps)
+			}
+		}
+
 		//log.Printf("[AVC] %v, len: %d, ts: %10d, seq: %d", NALUTypes(payload), len(payload), packet.Timestamp, packet.SequenceNumber)
 
 		clone := *packet
