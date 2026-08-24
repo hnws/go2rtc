@@ -32,10 +32,20 @@ func RepairAVCC(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 		switch NALUType(packet.Payload) {
 		case NALUTypeSPS:
 			sps = append([]byte(nil), packet.Payload[4:]...)
-			ps = JoinNALU(sps, pps)
+			// only replace ps once we have a complete, consistent pair - an
+			// SPS update alone must not leave ps as an SPS with a stale or
+			// missing PPS
+			if len(pps) > 0 {
+				ps = JoinNALU(sps, pps)
+			}
 		case NALUTypePPS:
 			pps = append([]byte(nil), packet.Payload[4:]...)
-			ps = JoinNALU(sps, pps)
+			// same as above: some sources send SPS once and only repeat PPS
+			// per keyframe, so a PPS-only update must not leave ps as a PPS
+			// with no SPS, which is worse than not repairing at all
+			if len(sps) > 0 {
+				ps = JoinNALU(sps, pps)
+			}
 		case NALUTypeIFrame:
 			packet.Payload = Join(ps, packet.Payload)
 		}

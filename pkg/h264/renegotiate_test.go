@@ -92,3 +92,58 @@ func TestRepairAVCC_LearnsFreshParameterSet(t *testing.T) {
 	send(iframe)
 	require.Equal(t, Join(JoinNALU(sps[4:], pps[4:]), iframe), got)
 }
+
+// TestRTPDepay_IgnoresPartialParameterSet covers a source that sends SPS
+// once (e.g. at the very start of the underlying producer connection, well
+// before this particular consumer ever attached) and only repeats PPS with
+// each keyframe afterwards. A consumer that only ever observes the repeated
+// PPS must not build ps from a PPS with no SPS - that's worse than leaving
+// the keyframe bare, since it hands the decoder a parameter set reference
+// that can never resolve.
+func TestRTPDepay_IgnoresPartialParameterSet(t *testing.T) {
+	pps := avccNAL(NALUTypePPS, 0x44)
+	iframe := avccNAL(NALUTypeIFrame, 0xAA, 0xBB, 0xCC, 0xDD)
+
+	codec := &core.Codec{Name: core.CodecH264, FmtpLine: ""}
+
+	var got []byte
+	depay := RTPDepay(codec, func(packet *rtp.Packet) {
+		got = append([]byte(nil), packet.Payload...)
+	})
+	pay := RTPPay(0, depay)
+
+	send := func(nal []byte, ts uint32) {
+		pay(&rtp.Packet{
+			Header:  rtp.Header{Timestamp: ts, Version: RTPPacketVersionAVC},
+			Payload: nal,
+		})
+	}
+
+	// PPS repeats, but SPS is never seen by this consumer.
+	got = nil
+	send(pps, 1)
+	send(iframe, 1)
+	require.Equal(t, iframe, got, "must not inject a PPS with no matching SPS")
+}
+
+// TestRepairAVCC_IgnoresPartialParameterSet is the AVCC-producer equivalent
+// of TestRTPDepay_IgnoresPartialParameterSet.
+func TestRepairAVCC_IgnoresPartialParameterSet(t *testing.T) {
+	pps := avccNAL(NALUTypePPS, 0x44)
+	iframe := avccNAL(NALUTypeIFrame, 0xAA, 0xBB, 0xCC, 0xDD)
+
+	codec := &core.Codec{Name: core.CodecH264, FmtpLine: ""}
+
+	var got []byte
+	fn := RepairAVCC(codec, func(packet *rtp.Packet) {
+		got = append([]byte(nil), packet.Payload...)
+	})
+
+	send := func(nal []byte) {
+		fn(&rtp.Packet{Payload: append([]byte(nil), nal...)})
+	}
+
+	send(pps)
+	send(iframe)
+	require.Equal(t, iframe, got, "must not inject a PPS with no matching SPS")
+}

@@ -17,9 +17,42 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 	depack := &codecs.H264Packet{IsAVC: true}
 
 	sps, pps := GetParameterSet(codec.FmtpLine)
-	ps := JoinNALU(sps, pps)
+	var ps []byte
+	if len(sps) > 0 && len(pps) > 0 {
+		ps = JoinNALU(sps, pps)
+	}
+
+	// The source can start sending a fresh SPS/PPS in-band (e.g. after a
+	// remote renegotiation changes resolution/profile, or when the original
+	// offer/answer never carried sprop-parameter-sets at all) without go2rtc
+	// ever seeing a new SDP. learn keeps sps/pps/ps in sync with whatever was
+	// last actually seen in the stream, so a keyframe that omits its own
+	// parameter set is repaired with the current set, not a stale or empty
+	// one from the original negotiation. ps is only ever replaced once both
+	// halves are known - an update from just one of SPS/PPS (some sources
+	// send SPS once and only repeat PPS per keyframe) must not leave ps as
+	// one without the other, which is worse than not repairing at all.
+	learn := func(nalus [][]byte) {
+		for _, nalu := range nalus {
+			switch NALUType(nalu) {
+			case NALUTypeSPS:
+				sps = append([]byte(nil), nalu[4:]...)
+			case NALUTypePPS:
+				pps = append([]byte(nil), nalu[4:]...)
+			}
+		}
+		if len(sps) > 0 && len(pps) > 0 {
+			ps = JoinNALU(sps, pps)
+		}
+	}
 
 	buf := make([]byte, 0, 512*1024) // 512K
+	// bufDirty is true once buf holds actual NAL/Access-Unit fragment bytes
+	// (a multi-packet NAL still being reassembled), as opposed to only
+	// holding small buffered SPS/PPS chunks from the branch below. Only in
+	// the latter case is it safe to drop buf's content instead of merging it
+	// - dropping real fragment bytes would corrupt the frame.
+	bufDirty := false
 
 	return func(packet *rtp.Packet) {
 		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
@@ -33,6 +66,7 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 		// https://github.com/AlexxIT/go2rtc/issues/675
 		if len(buf) > 5*1024*1024 {
 			buf = buf[: 0 : 512*1024]
+			bufDirty = false
 		}
 
 		// Fix TP-Link Tapo TC70: sends SPS and PPS with packet.Marker = true
@@ -40,6 +74,7 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 		if packet.Marker && len(payload) < PSMaxSize {
 			switch NALUType(payload) {
 			case NALUTypeSPS, NALUTypePPS:
+				learn(SplitNALU(payload))
 				buf = append(buf, payload...)
 				return
 			case NALUTypeSEI:
@@ -78,14 +113,35 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 
 		// collect all NALs for Access Unit
 		if !packet.Marker {
+			switch NALUType(payload) {
+			case NALUTypeSPS, NALUTypePPS:
+				// a standalone parameter-set NAL delivered unmarked (e.g. a
+				// STAP-A aggregate that defers the marker bit to the NALU
+				// that follows it) is still complete on its own, not a
+				// fragment of something larger - learn from it like the
+				// marked case above, and don't treat buf as holding
+				// unrelated fragment data
+				learn(SplitNALU(payload))
+			default:
+				bufDirty = true
+			}
 			buf = append(buf, payload...)
 			return
 		}
 
 		if len(buf) > 0 {
+			if !bufDirty && !(len(sps) > 0 && len(pps) > 0) {
+				// buf only ever received small buffered SPS/PPS chunks above,
+				// and they never formed a complete pair (e.g. a source that
+				// repeats PPS but never SPS for this consumer) - injecting
+				// that alone gives the decoder a parameter set reference it
+				// can never resolve, worse than leaving the keyframe bare
+				buf = buf[:0]
+			}
 			payload = append(buf, payload...)
 			buf = buf[:0]
 		}
+		bufDirty = false
 
 		// should not be that huge SPS
 		if NALUType(payload) == NALUTypeSPS && binary.BigEndian.Uint32(payload) >= PSMaxSize {
@@ -95,30 +151,9 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 			payload = annexb.FixAnnexBInAVCC(payload)
 		}
 
-		// The source can start sending a fresh SPS/PPS in-band (e.g. after a
-		// remote renegotiation changes resolution/profile, or when the
-		// original offer/answer never carried sprop-parameter-sets at all)
-		// without go2rtc ever seeing a new SDP. Keep sps/pps in sync with
-		// whatever was last actually seen in the stream, so a later keyframe
-		// that omits its own parameter set (the "fix IFrame without SPS,PPS"
-		// case above) is repaired with the current set, not a stale or empty
-		// one from the original negotiation.
 		switch NALUType(payload) {
 		case NALUTypeSPS, NALUTypePPS:
-			updated := false
-			for _, nalu := range SplitNALU(payload) {
-				switch NALUType(nalu) {
-				case NALUTypeSPS:
-					sps = append([]byte(nil), nalu[4:]...)
-					updated = true
-				case NALUTypePPS:
-					pps = append([]byte(nil), nalu[4:]...)
-					updated = true
-				}
-			}
-			if updated {
-				ps = JoinNALU(sps, pps)
-			}
+			learn(SplitNALU(payload))
 		}
 
 		//log.Printf("[AVC] %v, len: %d, ts: %10d, seq: %d", NALUTypes(payload), len(payload), packet.Timestamp, packet.SequenceNumber)
