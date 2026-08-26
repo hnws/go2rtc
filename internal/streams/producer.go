@@ -129,8 +129,17 @@ func (p *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receive
 		return nil, errors.New("get track from none state")
 	}
 
+	// Match by media, not by codec pointer. Every new consumer attach parses
+	// its own fresh *core.Codec from its own SDP negotiation, so a
+	// codec-pointer cache here almost always misses even for the same
+	// logical track - which used to append a fresh duplicate into
+	// p.receivers on every single attach. Over many consumer reconnects
+	// (e.g. an NVR retrying every few seconds for hours) that list grows
+	// unbounded, making this lookup - and stopProducers()'s and reconnect()'s
+	// own scans of p.receivers - progressively slower.
 	for _, track := range p.receivers {
-		if track.Codec == codec {
+		if track.Media == media {
+			track.Codec = codec
 			return track, nil
 		}
 	}
