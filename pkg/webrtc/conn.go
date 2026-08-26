@@ -102,6 +102,17 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
 			if err != nil {
+				// A read error on just this track (e.g. the remote drops the
+				// SSRC on a mid-session renegotiation) used to end only this
+				// goroutine silently - the PeerConnection stayed "connected"
+				// with every other track still flowing, so nothing ever
+				// noticed or reconnected. Observed live: a Nest producer's
+				// audio track kept receiving for hours after its video track
+				// died this way, and every consumer sat at zero video bytes
+				// until the whole service was restarted by hand. Close the
+				// connection so the owning Producer's normal reconnect path
+				// (armReconnect/reconnect) picks it back up automatically.
+				_ = c.Close()
 				return
 			}
 
@@ -109,7 +120,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
-				return
+				continue // skip a single malformed packet, don't kill the whole track
 			}
 
 			if len(packet.Payload) == 0 {
