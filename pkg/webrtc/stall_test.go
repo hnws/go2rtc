@@ -1,6 +1,9 @@
 package webrtc
 
 import (
+	"bytes"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -8,6 +11,7 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 )
 
@@ -119,7 +123,7 @@ func withStallTimeout(t *testing.T, d time.Duration) {
 func waitConnected(t *testing.T, prod *Conn, cam *fakeCamera) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		return prod.pc.ConnectionState() == webrtc.PeerConnectionStateConnected && cam.videoSent.Load() > 10 && prod.Recv > 0
+		return prod.pc.ConnectionState() == webrtc.PeerConnectionStateConnected && cam.videoSent.Load() > 10
 	}, 10*time.Second, 20*time.Millisecond, "peers never connected / no media")
 }
 
@@ -155,4 +159,81 @@ func TestVideoStall_KeepsHealthyStreamOpen(t *testing.T) {
 		t.Fatal("watchdog closed a connection whose video was still flowing")
 	case <-time.After(4 * time.Second):
 	}
+}
+
+// captureLogs points the package Logger at a buffer for the test.
+func captureLogs(t *testing.T) *syncBuffer {
+	buf := &syncBuffer{}
+	old := Logger
+	Logger = zerolog.New(buf)
+	t.Cleanup(func() { Logger = old })
+	return buf
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// An ordinary teardown makes the blocked reads return io.EOF (or an
+// interceptor-closed error). That must not be reported or handled as a
+// failure - neither for our own Close nor for the streams-side Stop, which
+// goes through the promoted core.Connection.Stop and closes pion directly.
+func TestTrackRead_TeardownIsNotReportedAsFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(*Conn) error
+	}{
+		{"Close", func(c *Conn) error { return c.Close() }},
+		{"streams-side Stop", func(c *Conn) error { return c.Stop() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withStallTimeout(t, 2*time.Second)
+			logs := captureLogs(t)
+			prod, cam := connectActiveProducer(t)
+			waitConnected(t, prod, cam)
+
+			done := startDone(prod)
+			require.NoError(t, tc.stop(prod))
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Start did not return after the connection was stopped")
+			}
+			time.Sleep(300 * time.Millisecond) // let both read loops observe the teardown
+			require.NotContains(t, logs.String(), "read failed on a live connection")
+			require.NotContains(t, logs.String(), "stalled")
+		})
+	}
+}
+
+// The stall path logs exactly one clear reason, and not a generic read failure.
+func TestVideoStall_LogsTheStall(t *testing.T) {
+	withStallTimeout(t, time.Second)
+	logs := captureLogs(t)
+	prod, cam := connectActiveProducer(t)
+	waitConnected(t, prod, cam)
+
+	done := startDone(prod)
+	cam.videoOff.Store(true)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stall not detected")
+	}
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, strings.Count(logs.String(), "video track stalled"))
+	require.NotContains(t, logs.String(), "read failed on a live connection")
 }

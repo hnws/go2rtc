@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -38,6 +39,9 @@ type Conn struct {
 
 	offer  string
 	closed core.Waiter
+
+	recvMu   sync.Mutex // audio and video read loops both add to Recv
+	tracksMu sync.Mutex // serializes GetTrack's lookup-or-create on Receivers
 }
 
 func NewConn(pc *webrtc.PeerConnection) *Conn {
@@ -136,10 +140,25 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
 			if err != nil {
+				// Every teardown (our Close, the streams-side Stop via the
+				// promoted core.Connection.Stop, a remote close) surfaces here
+				// as a read error - io.EOF, or an unexported "interceptor is
+				// closed" when transport-cc is negotiated. pion sets
+				// SignalingStateClosed before it stops the receivers on all of
+				// those paths, so that state, not the error value, tells an
+				// ordinary shutdown from a real failure on a live connection.
+				if pc.SignalingState() == webrtc.SignalingStateClosed {
+					return
+				}
+
 				if watch && isTimeout(err) {
-					Logger.Warn().Uint32("id", c.ID).Str("remote", c.RemoteAddr).
+					Logger.Warn().Uint32("id", c.ID).Str("url", c.URL).
 						Dur("timeout", stall).
 						Msg("[webrtc] video track stalled, closing connection to reconnect")
+				} else {
+					Logger.Warn().Uint32("id", c.ID).Str("url", c.URL).
+						Str("kind", remote.Kind().String()).Err(err).
+						Msg("[webrtc] track read failed on a live connection, closing to reconnect")
 				}
 				// A read error on just this track (e.g. the remote drops the
 				// SSRC on a mid-session renegotiation) used to end only this
@@ -155,7 +174,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				return
 			}
 
+			c.recvMu.Lock()
 			c.Recv += n
+			c.recvMu.Unlock()
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {

@@ -8,6 +8,13 @@ import (
 func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
 	core.Assert(media.Direction == core.DirectionRecvonly)
 
+	// OnTrack runs one goroutine per remote track, and each calls GetTrack
+	// (the streams layer does too, e.g. on reconnect). Unsynchronized, two
+	// concurrent calls could both miss in the lookup below and append at
+	// once, losing a Receiver. Found with -race.
+	c.tracksMu.Lock()
+	defer c.tracksMu.Unlock()
+
 	// Match by media, not by codec pointer. pion's OnTrack can fire more than
 	// once for the same logical m-line within the life of a single
 	// PeerConnection (e.g. the remote renegotiates and hands us a fresh
@@ -56,4 +63,23 @@ func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, e
 func (c *Conn) Start() error {
 	c.closed.Wait()
 	return nil
+}
+
+// Stop shadows the promoted core.Connection.Stop, which is what the streams
+// layer (and nest.WebRTCClient.Stop) calls. It snapshots Receivers under
+// tracksMu because a late OnTrack may still be appending in GetTrack while the
+// stream is being stopped (found with -race). The closes run outside the lock
+// so pc.Close can never wait on a track goroutine blocked in GetTrack.
+func (c *Conn) Stop() error {
+	c.tracksMu.Lock()
+	receivers := append([]*core.Receiver(nil), c.Receivers...)
+	c.tracksMu.Unlock()
+
+	for _, receiver := range receivers {
+		receiver.Close()
+	}
+	for _, sender := range c.Senders {
+		sender.Close()
+	}
+	return c.pc.Close()
 }

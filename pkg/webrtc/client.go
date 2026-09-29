@@ -62,18 +62,18 @@ func (c *Conn) SetAnswer(answer string) (err error) {
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  fakeFormatsInAnswer(c.pc.LocalDescription().SDP, answer),
 	}
-	if err = c.pc.SetRemoteDescription(desc); err != nil {
-		return err
-	}
 
 	sd := &sdp.SessionDescription{}
 	if err = sd.Unmarshal([]byte(answer)); err != nil {
 		return err
 	}
 
+	// Set Medias before SetRemoteDescription: that call starts the
+	// connection, and OnTrack (which reads c.Medias in getMediaCodec) can
+	// fire on pion's goroutines before we get to run again.
 	c.Medias = UnmarshalMedias(sd.MediaDescriptions)
 
-	return nil
+	return c.pc.SetRemoteDescription(desc)
 }
 
 // fakeFormatsInAnswer - fix pion bug with remote SDP parsing:
