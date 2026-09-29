@@ -2,7 +2,9 @@ package webrtc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -10,7 +12,21 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	"github.com/rs/zerolog"
 )
+
+var Logger = zerolog.Nop()
+
+// VideoStallTimeout is how long an active producer's video track may go
+// without a single RTP packet before the connection is treated as dead and
+// closed, so the owning Producer reconnects. Zero disables the watchdog.
+//
+// Needed because a remote can stop sending video without any error: pion's
+// Read just blocks forever while the PeerConnection stays "connected" and
+// the other tracks keep flowing. Observed live on a Nest camera - video
+// stopped at 05:29 while audio kept arriving and the Nest session kept
+// being extended successfully, so nothing ever reconnected.
+var VideoStallTimeout = 20 * time.Second
 
 type Conn struct {
 	core.Connection
@@ -98,10 +114,33 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}()
 		}
 
+		// Only for connections go2rtc opened itself (Nest, webrtc: sources):
+		// those reconnect on close. Audio is excluded because Opus DTX can
+		// legitimately send nothing during silence.
+		stall := VideoStallTimeout
+		watch := stall > 0 && c.Mode == core.ModeActiveProducer &&
+			remote.Kind() == webrtc.RTPCodecTypeVideo
+		var armed time.Time
+
 		for {
+			if watch {
+				// Re-arm every quarter of the timeout rather than per packet.
+				// The interval must stay well below the timeout itself, or a
+				// healthy stream races its own deadline between re-arms.
+				if now := time.Now(); now.Sub(armed) >= stall/4 {
+					_ = remote.SetReadDeadline(now.Add(stall))
+					armed = now
+				}
+			}
+
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
 			if err != nil {
+				if watch && isTimeout(err) {
+					Logger.Warn().Uint32("id", c.ID).Str("remote", c.RemoteAddr).
+						Dur("timeout", stall).
+						Msg("[webrtc] video track stalled, closing connection to reconnect")
+				}
 				// A read error on just this track (e.g. the remote drops the
 				// SSRC on a mid-session renegotiation) used to end only this
 				// goroutine silently - the PeerConnection stayed "connected"
@@ -156,6 +195,13 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 	})
 
 	return c
+}
+
+// isTimeout reports whether err is a read-deadline expiry (pion returns a
+// net.Error with Timeout() == true from its packetio buffers).
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (c *Conn) MarshalJSON() ([]byte, error) {

@@ -33,6 +33,7 @@ func Init() {
 	app.LoadConfig(&cfg)
 
 	log = app.GetLogger("webrtc")
+	webrtc.Logger = log
 
 	if log.Debug().Enabled() {
 		itfs, _ := net.Interfaces()
