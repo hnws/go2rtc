@@ -107,10 +107,21 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
-		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
+		// Request a keyframe (RTCP PLI) every 2s. Upstream only does this for
+		// passive producers (WHIP/browser push). Nest is an active producer, and
+		// without it its keyframe interval drifts long when idle, so consumers
+		// that join mid-GOP (RTSP opens, frame.jpeg, Frigate after a reconnect)
+		// wait for one. Gated on FormatName rather than the mode, so other
+		// active WebRTC sources (battery cameras) aren't forced into 2s IDRs.
+		// PLI is media-plane RTCP, so it costs no Nest SDM API quota.
+		// From ajplotkin/go2rtc 9098713 (measured ~3.3s -> ~1.8s on a doorbell).
+		if (c.Mode == core.ModePassiveProducer || c.FormatName == "nest/webrtc") &&
+			remote.Kind() == webrtc.RTPCodecTypeVideo {
 			go func() {
 				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
-				for range time.NewTicker(time.Second * 2).C {
+				ticker := time.NewTicker(time.Second * 2)
+				defer ticker.Stop()
+				for range ticker.C {
 					if err := pc.WriteRTCP(pkts); err != nil {
 						return
 					}

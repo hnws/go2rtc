@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/rs/zerolog"
@@ -24,6 +25,7 @@ type fakeCamera struct {
 	videoOff  atomic.Bool
 	stop      chan struct{}
 	videoSent atomic.Int64
+	pli       atomic.Int64 // PictureLossIndication packets received for video
 }
 
 func loopbackAPI(t *testing.T) *webrtc.API {
@@ -36,11 +38,17 @@ func loopbackAPI(t *testing.T) *webrtc.API {
 // Nest client) to a fakeCamera over loopback and starts the camera sending.
 func connectActiveProducer(t *testing.T) (*Conn, *fakeCamera) {
 	t.Helper()
+	return connectProducer(t, "")
+}
+
+func connectProducer(t *testing.T, formatName string) (*Conn, *fakeCamera) {
+	t.Helper()
 
 	pcProd, err := loopbackAPI(t).NewPeerConnection(webrtc.Configuration{})
 	require.NoError(t, err)
 	prod := NewConn(pcProd)
 	prod.Mode = core.ModeActiveProducer
+	prod.FormatName = formatName
 
 	medias := []*core.Media{
 		{Kind: core.KindAudio, Direction: core.DirectionRecvonly},
@@ -62,8 +70,21 @@ func connectActiveProducer(t *testing.T) (*Conn, *fakeCamera) {
 	// AddTrack after SetRemoteDescription reuses the offer's transceivers
 	_, err = pcCam.AddTrack(cam.audio)
 	require.NoError(t, err)
-	_, err = pcCam.AddTrack(cam.video)
+	videoSender, err := pcCam.AddTrack(cam.video)
 	require.NoError(t, err)
+	go func() { // count keyframe requests (PLI) the producer sends for video
+		for {
+			pkts, _, err := videoSender.ReadRTCP()
+			if err != nil {
+				return
+			}
+			for _, pkt := range pkts {
+				if _, ok := pkt.(*rtcp.PictureLossIndication); ok {
+					cam.pli.Add(1)
+				}
+			}
+		}
+	}()
 	answer, err := pcCam.CreateAnswer(nil)
 	require.NoError(t, err)
 	gathered := webrtc.GatheringCompletePromise(pcCam)
@@ -236,4 +257,24 @@ func TestVideoStall_LogsTheStall(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	require.Equal(t, 1, strings.Count(logs.String(), "video track stalled"))
 	require.NotContains(t, logs.String(), "read failed on a live connection")
+}
+
+// Nest sources get a keyframe request (PLI) every 2s so consumers that join
+// mid-stream don't wait for the camera's own long keyframe interval.
+func TestKeyframeRequest_SentForNest(t *testing.T) {
+	prod, cam := connectProducer(t, "nest/webrtc")
+	waitConnected(t, prod, cam)
+
+	require.Eventually(t, func() bool { return cam.pli.Load() >= 2 }, 7*time.Second, 50*time.Millisecond,
+		"expected periodic PLIs for a nest/webrtc source, got %d", cam.pli.Load())
+}
+
+// Other active WebRTC sources (e.g. battery cameras) must not be forced into
+// frequent keyframes.
+func TestKeyframeRequest_NotSentForOtherActiveProducers(t *testing.T) {
+	prod, cam := connectProducer(t, "webrtc/whep")
+	waitConnected(t, prod, cam)
+
+	time.Sleep(5 * time.Second)
+	require.Zero(t, cam.pli.Load(), "a non-Nest active producer received PLIs")
 }
