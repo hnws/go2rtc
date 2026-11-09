@@ -2,6 +2,7 @@ package core
 
 import (
 	"crypto/rand"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -91,4 +92,25 @@ func Assert(ok bool) {
 func Caller() string {
 	_, file, line, _ := runtime.Caller(1)
 	return file + ":" + strconv.Itoa(line)
+}
+
+// RedactURL masks credentials in a source URL before it is logged. Nest
+// sources carry the OAuth client_secret and refresh_token in the query, and
+// log lines that print the source used to write them to the journal in full.
+func RedactURL(s string) string {
+	i := strings.IndexByte(s, '?')
+	if i < 0 {
+		return s
+	}
+	query, err := url.ParseQuery(s[i+1:])
+	if err != nil {
+		return s[:i] + "?<unparsable query>"
+	}
+	for key := range query {
+		switch strings.ToLower(key) {
+		case "client_secret", "refresh_token", "access_token", "token", "password", "secret":
+			query.Set(key, "***")
+		}
+	}
+	return s[:i+1] + query.Encode()
 }

@@ -47,7 +47,10 @@ const (
 	fastRetries = 4
 	backoffBase = 8 * time.Second
 	backoffCap  = 15 * time.Minute
+)
 
+// A var, not a const, so tests can shrink it.
+var (
 	// minConnLifetime is how long a connection has to survive before it
 	// counts as a real success and resets the failure streak. Some sources
 	// (e.g. a nest camera colliding with a still-active session on Google's
@@ -197,7 +200,7 @@ func (p *Producer) start() {
 		return
 	}
 
-	log.Debug().Msgf("[streams] start producer url=%s", p.url)
+	log.Debug().Msgf("[streams] start producer url=%s", core.RedactURL(p.url))
 
 	p.state = stateStart
 	p.workerID++
@@ -208,7 +211,10 @@ func (p *Producer) start() {
 func (p *Producer) worker(conn core.Producer, workerID int) {
 	connStart := time.Now()
 
-	if err := conn.Start(); err != nil {
+	err := conn.Start()
+	lived := time.Since(connStart)
+
+	if err != nil {
 		p.mu.Lock()
 		closed := p.workerID != workerID
 		p.mu.Unlock()
@@ -217,10 +223,20 @@ func (p *Producer) worker(conn core.Producer, workerID int) {
 			return
 		}
 
-		log.Warn().Err(err).Str("url", p.url).Caller().Send()
+		log.Warn().Err(err).Str("url", core.RedactURL(p.url)).Caller().Send()
+
+		// A connection that never delivered media never really connected,
+		// however long it waited before being closed. Without this, a Nest
+		// session that Google accepts but never feeds (closed by the webrtc
+		// first-video watchdog after 20s) would look like a success, reset
+		// the failure streak and reconnect immediately, forever - each attempt
+		// a GenerateWebRtcStream call against the SDM API quota.
+		if errors.Is(err, core.ErrNoMedia) {
+			lived = 0
+		}
 	}
 
-	p.armReconnect(workerID, time.Since(connStart))
+	p.armReconnect(workerID, lived)
 }
 
 // armReconnect decides the delay before the next reconnect attempt and
@@ -251,11 +267,11 @@ func (p *Producer) reconnect(workerID int) {
 
 	if p.workerID != workerID {
 		p.mu.Unlock()
-		log.Trace().Msgf("[streams] stop reconnect url=%s", p.url)
+		log.Trace().Msgf("[streams] stop reconnect url=%s", core.RedactURL(p.url))
 		return
 	}
 
-	log.Debug().Msgf("[streams] retry=%d to url=%s", p.failCount, p.url)
+	log.Debug().Msgf("[streams] retry=%d to url=%s", p.failCount, core.RedactURL(p.url))
 
 	conn, err := GetProducer(p.url)
 	if err != nil {
@@ -325,7 +341,7 @@ func (p *Producer) stop() {
 	// backoff delay into the next time this producer is started
 	p.failCount = 0
 
-	log.Debug().Msgf("[streams] stop producer url=%s", p.url)
+	log.Debug().Msgf("[streams] stop producer url=%s", core.RedactURL(p.url))
 
 	if p.conn != nil {
 		_ = p.conn.Stop()

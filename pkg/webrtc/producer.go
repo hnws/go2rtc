@@ -61,8 +61,12 @@ func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, e
 }
 
 func (c *Conn) Start() error {
-	c.closed.Wait()
-	return nil
+	if t := c.armFirstVideoWatchdog(); t != nil {
+		defer t.Stop()
+	}
+	// nil after an ordinary close; core.ErrNoMedia from the first-video
+	// watchdog, so the streams layer backs off instead of retrying at once.
+	return c.closed.Wait()
 }
 
 // Stop shadows the promoted core.Connection.Stop, which is what the streams

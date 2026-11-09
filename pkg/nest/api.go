@@ -582,7 +582,14 @@ var (
 	extendMaxRetries = 10
 )
 
-func (a *API) StartExtendStreamTimer() {
+// StartExtendStreamTimer keeps the stream session alive until
+// StopExtendStreamTimer. If extending fails extendMaxRetries times in a row it
+// gives up and calls onGiveUp (if not nil, in its own goroutine), which should
+// close the connection: Google drops the session soon after, and without a
+// close nothing ever reconnected - the producer stayed in Start with no media
+// (seen 2026-11-09 on a doorbell, "giving up ... stream will disconnect" and
+// then no disconnect for hours).
+func (a *API) StartExtendStreamTimer(onGiveUp func()) {
 	if a.extendTimer != nil {
 		return
 	}
@@ -598,6 +605,12 @@ func (a *API) StartExtendStreamTimer() {
 
 	Logger.Debug().Str("device", a.StreamDeviceID).Time("expires_at", a.StreamExpiresAt).
 		Msg("nest: extend timer started")
+
+	giveUp := func() {
+		if onGiveUp != nil {
+			go onGiveUp()
+		}
+	}
 
 	go func() {
 		defer close(done)
@@ -616,7 +629,8 @@ func (a *API) StartExtendStreamTimer() {
 
 						if failures >= extendMaxRetries {
 							Logger.Error().Str("device", a.StreamDeviceID).
-								Msg("nest: giving up on extending stream after repeated token refresh failures, stream will disconnect")
+								Msg("nest: giving up on extending stream after repeated token refresh failures, closing it to reconnect")
+							giveUp()
 							return
 						}
 
@@ -632,7 +646,8 @@ func (a *API) StartExtendStreamTimer() {
 
 					if failures >= extendMaxRetries {
 						Logger.Error().Str("device", a.StreamDeviceID).
-							Msg("nest: giving up on extending stream after repeated failures, stream will disconnect")
+							Msg("nest: giving up on extending stream after repeated failures, closing it to reconnect")
+						giveUp()
 						return
 					}
 

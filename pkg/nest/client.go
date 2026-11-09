@@ -85,7 +85,7 @@ func (c *WebRTCClient) AddTrack(media *core.Media, codec *core.Codec, track *cor
 }
 
 func (c *WebRTCClient) Start() error {
-	c.api.StartExtendStreamTimer()
+	c.api.StartExtendStreamTimer(func() { _ = c.conn.Close() })
 	return c.conn.Start()
 }
 
@@ -190,7 +190,7 @@ func (c *RTSPClient) GetTrack(media *core.Media, codec *core.Codec) (*core.Recei
 }
 
 func (c *RTSPClient) Start() error {
-	c.api.StartExtendStreamTimer()
+	c.api.StartExtendStreamTimer(func() { _ = c.conn.Close() })
 	return c.conn.Start()
 }
 

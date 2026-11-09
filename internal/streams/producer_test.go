@@ -2,6 +2,7 @@ package streams
 
 import (
 	"testing"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/stretchr/testify/require"
@@ -55,4 +56,62 @@ func TestProducerGetTrack_RenegotiationReusesReceiver(t *testing.T) {
 
 	require.Len(t, p.receivers, 1, "must not accumulate a new entry per consumer attach")
 	require.Len(t, conn.receivers, 1, "must not call the underlying conn.GetTrack more than once for the same media")
+}
+
+// startErrConn is a producer whose Start returns err after lasting d,
+// running onEnd (if set) just before it returns.
+type startErrConn struct {
+	fakeTrackConn
+	d     time.Duration
+	err   error
+	onEnd func()
+}
+
+func (f *startErrConn) Start() error {
+	time.Sleep(f.d)
+	if f.onEnd != nil {
+		f.onEnd()
+	}
+	return f.err
+}
+
+// workerFailCount runs one worker cycle on a producer that already has a
+// failure streak of 3 and returns the streak afterwards.
+func workerFailCount(t *testing.T, conn *startErrConn) int {
+	t.Helper()
+
+	old := minConnLifetime
+	minConnLifetime = 20 * time.Millisecond
+	t.Cleanup(func() { minConnLifetime = old })
+
+	p := &Producer{url: "test:", conn: conn, state: stateStart, workerID: 1, failCount: 3}
+	if conn.err == nil {
+		// a clean end reconnects at once: retire this worker first so that
+		// reconnect is a no-op and can't touch failCount while we read it
+		conn.onEnd = func() {
+			p.mu.Lock()
+			p.workerID++
+			p.mu.Unlock()
+		}
+	}
+	p.worker(conn, 1)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.workerID++ // make the scheduled reconnect a no-op
+	return p.failCount
+}
+
+// A connection closed for never delivering media (the webrtc first-video
+// watchdog, 20s in production) must count as a failed connect even though it
+// outlived minConnLifetime, so the backoff keeps growing instead of resetting.
+func TestProducerWorker_NoMediaCountsAsFailure(t *testing.T) {
+	conn := &startErrConn{d: 50 * time.Millisecond, err: core.ErrNoMedia}
+	require.Equal(t, 4, workerFailCount(t, conn), "the failure streak must grow")
+}
+
+// A connection that lived long enough and ended cleanly still resets the streak.
+func TestProducerWorker_LongLivedConnectionResetsStreak(t *testing.T) {
+	conn := &startErrConn{d: 50 * time.Millisecond}
+	require.Equal(t, 1, workerFailCount(t, conn), "the failure streak must reset")
 }

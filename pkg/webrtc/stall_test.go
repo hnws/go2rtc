@@ -43,6 +43,13 @@ func connectActiveProducer(t *testing.T) (*Conn, *fakeCamera) {
 
 func connectProducer(t *testing.T, formatName string) (*Conn, *fakeCamera) {
 	t.Helper()
+	return connectProducerOpts(t, formatName, false)
+}
+
+// connectProducerOpts is connectProducer with the camera's video optionally
+// off from the very start, so the producer never gets a single video packet.
+func connectProducerOpts(t *testing.T, formatName string, videoOff bool) (*Conn, *fakeCamera) {
+	t.Helper()
 
 	pcProd, err := loopbackAPI(t).NewPeerConnection(webrtc.Configuration{})
 	require.NoError(t, err)
@@ -60,6 +67,7 @@ func connectProducer(t *testing.T, formatName string) (*Conn, *fakeCamera) {
 	pcCam, err := loopbackAPI(t).NewPeerConnection(webrtc.Configuration{})
 	require.NoError(t, err)
 	cam := &fakeCamera{pc: pcCam, stop: make(chan struct{})}
+	cam.videoOff.Store(videoOff)
 
 	cam.audio, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "audio", "cam")
 	require.NoError(t, err)
@@ -277,4 +285,55 @@ func TestKeyframeRequest_NotSentForOtherActiveProducers(t *testing.T) {
 
 	time.Sleep(5 * time.Second)
 	require.Zero(t, cam.pli.Load(), "a non-Nest active producer received PLIs")
+}
+
+// A session that connects but never sends a single video packet: pion never
+// fires OnTrack for the video, so the per-track stall deadline is never armed.
+// The first-video watchdog must close it with core.ErrNoMedia (the streams
+// layer then backs off). Seen on a Nest doorbell 2026-11-09, stuck for hours.
+func TestFirstVideo_ClosesWhenNoVideoEverArrives(t *testing.T) {
+	withStallTimeout(t, time.Second)
+	logs := captureLogs(t)
+	prod, cam := connectProducerOpts(t, "nest/webrtc", true)
+	require.Eventually(t, func() bool {
+		return prod.pc.ConnectionState() == webrtc.PeerConnectionStateConnected
+	}, 10*time.Second, 20*time.Millisecond, "peers never connected")
+	require.Zero(t, cam.videoSent.Load())
+
+	errc := make(chan error, 1)
+	started := time.Now()
+	go func() { errc <- prod.Start() }()
+
+	select {
+	case err := <-errc:
+		require.ErrorIs(t, err, core.ErrNoMedia)
+		require.GreaterOrEqual(t, time.Since(started), 900*time.Millisecond, "closed before the timeout")
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection without any video stayed open")
+	}
+	require.Equal(t, 1, strings.Count(logs.String(), "no video received since start"))
+}
+
+// Video that does arrive keeps the connection open past the first-video
+// timeout, and an ordinary close afterwards still returns nil.
+func TestFirstVideo_KeepsStreamWithVideoOpen(t *testing.T) {
+	withStallTimeout(t, time.Second)
+	prod, cam := connectProducer(t, "nest/webrtc")
+	waitConnected(t, prod, cam)
+
+	errc := make(chan error, 1)
+	go func() { errc <- prod.Start() }()
+	select {
+	case err := <-errc:
+		t.Fatalf("a connection with flowing video was closed: %v", err)
+	case <-time.After(3 * time.Second):
+	}
+
+	require.NoError(t, prod.Close())
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after Close")
+	}
 }

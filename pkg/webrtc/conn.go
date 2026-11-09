@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -29,6 +30,14 @@ var Logger = zerolog.Nop()
 // being extended successfully, so nothing ever reconnected.
 var VideoStallTimeout = 20 * time.Second
 
+// The per-track stall deadline above only exists once pion fires OnTrack, and
+// pion fires OnTrack on a track's first RTP packet. A session whose video never
+// sends a single packet therefore had no watchdog at all. Seen 2026-11-09 on a
+// Nest doorbell after a restart: Google accepted the WebRTC session, then
+// rejected every extend ("invalid session"), no RTP ever arrived, and the
+// producer sat in Start for hours while Frigate reconnected every 10 s.
+// Start arms a first-video timer with the same VideoStallTimeout to cover it.
+
 type Conn struct {
 	core.Connection
 	core.Listener
@@ -42,6 +51,8 @@ type Conn struct {
 
 	recvMu   sync.Mutex // audio and video read loops both add to Recv
 	tracksMu sync.Mutex // serializes GetTrack's lookup-or-create on Receivers
+
+	videoSeen atomic.Bool // a video RTP packet has arrived (first-video watchdog)
 }
 
 func NewConn(pc *webrtc.PeerConnection) *Conn {
@@ -132,10 +143,11 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// Only for connections go2rtc opened itself (Nest, webrtc: sources):
 		// those reconnect on close. Audio is excluded because Opus DTX can
 		// legitimately send nothing during silence.
+		isVideo := remote.Kind() == webrtc.RTPCodecTypeVideo
 		stall := VideoStallTimeout
-		watch := stall > 0 && c.Mode == core.ModeActiveProducer &&
-			remote.Kind() == webrtc.RTPCodecTypeVideo
+		watch := stall > 0 && c.Mode == core.ModeActiveProducer && isVideo
 		var armed time.Time
+		var seen bool
 
 		for {
 			if watch {
@@ -163,11 +175,11 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				}
 
 				if watch && isTimeout(err) {
-					Logger.Warn().Uint32("id", c.ID).Str("url", c.URL).
+					Logger.Warn().Uint32("id", c.ID).Str("url", core.RedactURL(c.URL)).
 						Dur("timeout", stall).
 						Msg("[webrtc] video track stalled, closing connection to reconnect")
 				} else {
-					Logger.Warn().Uint32("id", c.ID).Str("url", c.URL).
+					Logger.Warn().Uint32("id", c.ID).Str("url", core.RedactURL(c.URL)).
 						Str("kind", remote.Kind().String()).Err(err).
 						Msg("[webrtc] track read failed on a live connection, closing to reconnect")
 				}
@@ -188,6 +200,11 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			c.recvMu.Lock()
 			c.Recv += n
 			c.recvMu.Unlock()
+
+			if isVideo && !seen {
+				c.videoSeen.Store(true)
+				seen = true
+			}
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
@@ -227,6 +244,36 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 	})
 
 	return c
+}
+
+// armFirstVideoWatchdog closes the connection with core.ErrNoMedia if no video
+// packet arrives within VideoStallTimeout. Only for active producers whose
+// negotiated media include video; nil when it doesn't apply.
+func (c *Conn) armFirstVideoWatchdog() *time.Timer {
+	stall := VideoStallTimeout
+	if stall <= 0 || c.Mode != core.ModeActiveProducer || !c.expectsVideo() {
+		return nil
+	}
+
+	return time.AfterFunc(stall, func() {
+		if c.videoSeen.Load() {
+			return
+		}
+		Logger.Warn().Uint32("id", c.ID).Str("url", core.RedactURL(c.URL)).
+			Dur("timeout", stall).
+			Msg("[webrtc] no video received since start, closing connection to reconnect")
+		c.closed.Done(core.ErrNoMedia)
+		_ = c.pc.Close()
+	})
+}
+
+func (c *Conn) expectsVideo() bool {
+	for _, media := range c.Medias {
+		if media.Kind == core.KindVideo && media.Direction == core.DirectionRecvonly {
+			return true
+		}
+	}
+	return false
 }
 
 // isTimeout reports whether err is a read-deadline expiry (pion returns a

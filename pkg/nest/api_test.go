@@ -123,7 +123,7 @@ func TestStartExtendStreamTimer_RetriesTransientFailure(t *testing.T) {
 		StreamExpiresAt: time.Now().Add(50 * time.Millisecond),
 	}
 
-	a.StartExtendStreamTimer()
+	a.StartExtendStreamTimer(nil)
 	t.Cleanup(a.StopExtendStreamTimer)
 
 	// Poll only the log output (already mutex-guarded) rather than the
@@ -175,7 +175,7 @@ func TestStartExtendStreamTimer_GivesUpAndLogs(t *testing.T) {
 		StreamExpiresAt: time.Now().Add(5 * time.Millisecond),
 	}
 
-	a.StartExtendStreamTimer()
+	a.StartExtendStreamTimer(nil)
 	t.Cleanup(a.StopExtendStreamTimer)
 
 	deadline := time.After(2 * time.Second)
@@ -188,6 +188,49 @@ func TestStartExtendStreamTimer_GivesUpAndLogs(t *testing.T) {
 			t.Fatalf("expected the extend loop to give up and log it, got: %s", buf.String())
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+// Giving up must close the connection (via onGiveUp) so the producer
+// reconnects. Before, the loop only logged "stream will disconnect" and
+// returned; Google rejected the session, nothing closed it, and the doorbell
+// sat without video for hours (2026-11-09).
+func TestStartExtendStreamTimer_GiveUpClosesStream(t *testing.T) {
+	origMinDelay, origRetryDelay, origMaxRetries := extendMinDelay, extendRetryDelay, extendMaxRetries
+	extendMinDelay = 5 * time.Millisecond
+	extendRetryDelay = 5 * time.Millisecond
+	extendMaxRetries = 3
+	t.Cleanup(func() {
+		extendMinDelay, extendRetryDelay, extendMaxRetries = origMinDelay, origRetryDelay, origMaxRetries
+	})
+
+	var requests atomic.Int32
+	withMockGoogle(t, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":400,"message":"WebRtc error caused by invalid session or user id mismatch.","status":"FAILED_PRECONDITION"}}`))
+	})
+
+	a := &API{
+		Token:           "tok",
+		ExpiresAt:       time.Now().Add(time.Hour),
+		StreamProjectID: "proj",
+		StreamDeviceID:  "dev",
+		StreamSessionID: "session-1",
+		StreamExpiresAt: time.Now().Add(5 * time.Millisecond),
+	}
+
+	closed := make(chan struct{})
+	a.StartExtendStreamTimer(func() { close(closed) })
+	t.Cleanup(a.StopExtendStreamTimer)
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("extend loop gave up without closing the stream")
+	}
+	if n := requests.Load(); n != 3 {
+		t.Fatalf("expected the loop to give up after extendMaxRetries=3 attempts, got %d requests", n)
 	}
 }
 

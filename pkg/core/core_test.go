@@ -118,3 +118,13 @@ func TestName(t *testing.T) {
 	// stage3
 	_ = prod2.Stop()
 }
+
+// Nest source URLs carry OAuth secrets; the log lines must not.
+func TestRedactURL(t *testing.T) {
+	got := RedactURL("nest:?client_id=abc.apps.googleusercontent.com&client_secret=GOCSPX-s3cr3t&refresh_token=1//r3fr3sh&project_id=p1&device_id=d1")
+	require.NotContains(t, got, "s3cr3t")
+	require.NotContains(t, got, "r3fr3sh")
+	require.Contains(t, got, "device_id=d1")
+	require.Contains(t, got, "client_secret=%2A%2A%2A")
+	require.Equal(t, "rtsp://192.168.1.10/ch0", RedactURL("rtsp://192.168.1.10/ch0"))
+}

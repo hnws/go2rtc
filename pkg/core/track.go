@@ -9,6 +9,11 @@ import (
 
 var ErrCantGetTrack = errors.New("can't get track")
 
+// ErrNoMedia is returned by a Producer's Start when its connection was closed
+// because it never delivered any media. The streams layer counts that as a
+// failed connect (backoff applies) however long the connection sat waiting.
+var ErrNoMedia = errors.New("connection delivered no media")
+
 type Receiver struct {
 	Node
 
