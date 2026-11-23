@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -153,6 +154,13 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		var armed time.Time
 		var seen bool
 
+		// remember the SPS/PPS the source sends in-band (a WebRTC SDP never
+		// carries them), for answers and MSE init segments built later
+		learnH264 := track.Codec != nil && track.Codec.Name == core.CodecH264
+		if learnH264 {
+			defer h264.ForgetParams(track.Codec)
+		}
+
 		for {
 			if watch {
 				// Re-arm every quarter of the timeout rather than per packet.
@@ -217,6 +225,10 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 			if len(packet.Payload) == 0 {
 				continue
+			}
+
+			if learnH264 {
+				h264.LearnRTP(track.Codec, packet.Payload)
 			}
 
 			track.WriteRTP(packet)

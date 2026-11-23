@@ -15,12 +15,30 @@ type Muxer struct {
 	dts    []uint64
 	pts    []uint32
 	codecs []*core.Codec
+	fmtps  []string // per-track override for GetInit, see SetFmtp
 }
 
 func (m *Muxer) AddTrack(codec *core.Codec) {
 	m.dts = append(m.dts, 0)
 	m.pts = append(m.pts, 0)
 	m.codecs = append(m.codecs, codec)
+	m.fmtps = append(m.fmtps, "")
+}
+
+// SetFmtp makes GetInit describe track i with fmtp instead of its codec's
+// FmtpLine (parameter sets learned from the stream itself), without writing
+// to a codec other goroutines may read.
+func (m *Muxer) SetFmtp(i int, fmtp string) {
+	if i < len(m.fmtps) {
+		m.fmtps[i] = fmtp
+	}
+}
+
+func (m *Muxer) fmtpLine(i int, codec *core.Codec) string {
+	if i < len(m.fmtps) && m.fmtps[i] != "" {
+		return m.fmtps[i]
+	}
+	return codec.FmtpLine
 }
 
 func (m *Muxer) GetInit() ([]byte, error) {
@@ -33,7 +51,7 @@ func (m *Muxer) GetInit() ([]byte, error) {
 	for i, codec := range m.codecs {
 		switch codec.Name {
 		case core.CodecH264:
-			sps, pps := h264.GetParameterSet(codec.FmtpLine)
+			sps, pps := h264.GetParameterSet(m.fmtpLine(i, codec))
 			// some dummy SPS and PPS not a problem for MP4, but problem for HLS :(
 			if len(sps) == 0 {
 				sps = []byte{0x67, 0x42, 0x00, 0x0a, 0xf8, 0x41, 0xa2}

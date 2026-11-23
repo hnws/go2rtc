@@ -3,7 +3,9 @@ package mp4
 import (
 	"errors"
 	"io"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -20,10 +22,20 @@ type Consumer struct {
 	mu    sync.Mutex
 	start bool
 
+	// An H.264 source that never announced SPS/PPS (WebRTC: Nest) would get a
+	// dummy SPS in the init segment, which Firefox's decoder can't handle.
+	// WriteTo then waits for the first keyframe and builds the init segment
+	// from its in-band SPS/PPS (paramsReady), up to paramsWait.
+	paramsReady chan struct{}
+	paramsOnce  sync.Once
+
 	Rotate int `json:"-"`
 	ScaleX int `json:"-"`
 	ScaleY int `json:"-"`
 }
+
+// paramsWait caps how long WriteTo waits for a first keyframe with SPS/PPS.
+var paramsWait = 5 * time.Second
 
 func NewConsumer(medias []*core.Media) *Consumer {
 	if medias == nil {
@@ -62,12 +74,23 @@ func NewConsumer(medias []*core.Media) *Consumer {
 
 func (c *Consumer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
 	trackID := byte(len(c.Senders))
+	var learnedFmtp string
 
 	codec := track.Codec.Clone()
 	handler := core.NewSender(media, codec)
 
 	switch track.Codec.Name {
 	case core.CodecH264:
+		// use what the producer learned in-band when the source's SDP had no
+		// parameter sets; otherwise wait for this stream's first keyframe
+		needParams := false
+		if fmtp := h264.LearnedFmtpLine(track.Codec); strings.Contains(fmtp, "sprop-parameter-sets=") {
+			learnedFmtp = fmtp // applied once the muxer has this track
+		} else if c.paramsReady == nil {
+			c.paramsReady = make(chan struct{})
+			needParams = true
+		}
+
 		handler.Handler = func(packet *rtp.Packet) {
 			if !c.start {
 				if !h264.IsKeyframe(packet.Payload) {
@@ -78,6 +101,14 @@ func (c *Consumer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 
 			// important to use Mutex because right fragment order
 			c.mu.Lock()
+			if needParams {
+				needParams = false
+				if fmtp := h264.GetFmtpLine(packet.Payload); strings.Contains(fmtp, "sprop-parameter-sets=") &&
+					strings.Contains(core.Between(fmtp, "sprop-parameter-sets=", ";"), ",") {
+					c.muxer.SetFmtp(int(trackID), fmtp)
+				}
+				c.paramsOnce.Do(func() { close(c.paramsReady) })
+			}
 			b := c.muxer.GetPayload(trackID, packet)
 			if n, err := c.wr.Write(b); err == nil {
 				c.Send += n
@@ -157,6 +188,9 @@ func (c *Consumer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 	}
 
 	c.muxer.AddTrack(codec)
+	if learnedFmtp != "" {
+		c.muxer.SetFmtp(int(trackID), learnedFmtp)
+	}
 
 	handler.HandleRTP(track)
 	c.Senders = append(c.Senders, handler)
@@ -169,7 +203,16 @@ func (c *Consumer) WriteTo(wr io.Writer) (int64, error) {
 		c.start = true
 	}
 
+	if c.paramsReady != nil {
+		select {
+		case <-c.paramsReady:
+		case <-time.After(paramsWait):
+		}
+	}
+
+	c.mu.Lock()
 	init, err := c.muxer.GetInit()
+	c.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}

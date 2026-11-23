@@ -47,7 +47,11 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
 }
 
 func (w *WriteBuffer) Close() error {
-	if closer, ok := w.Writer.(io.Closer); ok {
+	// read the writer under the lock: Reset (WriteTo) swaps it concurrently
+	w.mu.Lock()
+	wr := w.Writer
+	w.mu.Unlock()
+	if closer, ok := wr.(io.Closer); ok {
 		return closer.Close()
 	}
 	w.mu.Lock()

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/AlexxIT/go2rtc/pkg/mp4"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
@@ -144,4 +145,22 @@ func TestAnswerCarriesSourceProfile(t *testing.T) {
 			require.NoError(t, client.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}))
 		})
 	}
+}
+
+// A WebRTC-sourced codec (Nest) has no sprop-parameter-sets; after the
+// producer learned them in-band, the answer carries them and a relaying
+// go2rtc labels the stream from the real SPS.
+func TestAnswerUsesLearnedParams(t *testing.T) {
+	src := &core.Codec{Name: core.CodecH264, ClockRate: 90000, PayloadType: 96, FmtpLine: "packetization-mode=1;profile-level-id=42e01f"}
+	sps, _ := base64.StdEncoding.DecodeString("Z2QQKKy4DwBE/LgIgAAAAwCAAAAKAg==")
+	h264.LearnRTP(src, sps)
+	h264.LearnRTP(src, ppsAny)
+	defer h264.ForgetParams(src)
+
+	m := offeredVideo()
+	chosen := chooseH264(m, m.Codecs[0], src)
+	require.Equal(t, uint8(98), chosen.PayloadType, "learned SPS says High")
+	p := answerH264Codec(chosen, src)
+	require.Contains(t, p.SDPFmtpLine, "sprop-parameter-sets=Z2QQKKy4DwBE/LgIgAAAAwCAAAAKAg==,")
+	require.Equal(t, `video/mp4; codecs="avc1.640028"`, mp4.ContentType([]*core.Codec{{Name: core.CodecH264, FmtpLine: p.SDPFmtpLine}}))
 }

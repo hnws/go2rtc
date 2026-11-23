@@ -34,10 +34,11 @@ func sourceProfileIDC(src *core.Codec) (byte, bool) {
 	if src == nil || src.Name != core.CodecH264 {
 		return 0, false
 	}
-	if sps, _ := h264.GetParameterSet(src.FmtpLine); len(sps) >= 2 {
+	fmtp := h264.LearnedFmtpLine(src)
+	if sps, _ := h264.GetParameterSet(fmtp); len(sps) >= 2 {
 		return sps[1], true
 	}
-	if s := core.Between(src.FmtpLine, "profile-level-id=", ";"); len(s) >= 2 {
+	if s := core.Between(fmtp, "profile-level-id=", ";"); len(s) >= 2 {
 		if b, err := hex.DecodeString(s[:2]); err == nil {
 			return b[0], true
 		}
@@ -101,7 +102,7 @@ func chooseH264(media *core.Media, matched, src *core.Codec) *core.Codec {
 // sprop-parameter-sets when the source has both SPS and PPS.
 func answerH264Codec(chosen, src *core.Codec) webrtc.RTPCodecParameters {
 	fmtp := chosen.FmtpLine
-	if sps, pps := h264.GetParameterSet(src.FmtpLine); len(sps) > 0 && len(pps) > 0 &&
+	if sps, pps := h264.GetParameterSet(h264.LearnedFmtpLine(src)); len(sps) > 0 && len(pps) > 0 &&
 		!strings.Contains(fmtp, "sprop-parameter-sets=") {
 		fmtp += ";sprop-parameter-sets=" + base64.StdEncoding.EncodeToString(sps) +
 			"," + base64.StdEncoding.EncodeToString(pps)
