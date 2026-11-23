@@ -53,6 +53,10 @@ type Conn struct {
 	tracksMu sync.Mutex // serializes GetTrack's lookup-or-create on Receivers
 
 	videoSeen atomic.Bool // a video RTP packet has arrived (first-video watchdog)
+
+	// answerCodecs holds, per transceiver mid, the one codec a server answer
+	// is narrowed to (set by AddTrack, applied by GetAnswer).
+	answerCodecs map[string]webrtc.RTPCodecParameters
 }
 
 func NewConn(pc *webrtc.PeerConnection) *Conn {

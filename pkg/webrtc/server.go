@@ -72,6 +72,16 @@ transeivers:
 		}
 	}
 
+	// narrow each H.264 sender's m-line to the one codec AddTrack chose, so a
+	// remote go2rtc labels the stream with the source's real profile
+	for _, tr := range c.pc.GetTransceivers() {
+		if params, ok := c.answerCodecs[tr.Mid()]; ok {
+			if err := tr.SetCodecPreferences([]webrtc.RTPCodecParameters{params}); err != nil {
+				Logger.Debug().Err(err).Str("mid", tr.Mid()).Msg("[webrtc] keep full H.264 answer")
+			}
+		}
+	}
+
 	if desc, err = c.pc.CreateAnswer(nil); err != nil {
 		return
 	}

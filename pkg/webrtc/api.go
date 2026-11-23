@@ -263,12 +263,6 @@ func RegisterDefaultCodecs(m *webrtc.MediaEngine) error {
 		}
 	}
 
-	videoRTCPFeedback := []webrtc.RTCPFeedback{
-		{"goog-remb", ""},
-		{"ccm", "fir"},
-		{"nack", ""},
-		{"nack", "pli"},
-	}
 	for _, codec := range []webrtc.RTPCodecParameters{
 		{
 			RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -313,4 +307,13 @@ func RegisterDefaultCodecs(m *webrtc.MediaEngine) error {
 	}
 
 	return nil
+}
+
+// videoRTCPFeedback is offered with every video codec, and repeated on the
+// single H.264 codec a server answer is narrowed to (see answerH264Codec).
+var videoRTCPFeedback = []webrtc.RTCPFeedback{
+	{Type: "goog-remb", Parameter: ""},
+	{Type: "ccm", Parameter: "fir"},
+	{Type: "nack", Parameter: ""},
+	{Type: "nack", Parameter: "pli"},
 }

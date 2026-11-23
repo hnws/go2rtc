@@ -8,6 +8,7 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/h265"
 	"github.com/AlexxIT/go2rtc/pkg/pcm"
 	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 )
 
 func (c *Conn) GetMedias() []*core.Media {
@@ -16,6 +17,16 @@ func (c *Conn) GetMedias() []*core.Media {
 
 func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	core.Assert(media.Direction == core.DirectionSendonly)
+
+	// Answering a remote offer: send H.264 under the offered entry that matches
+	// the source's profile and remember it, so GetAnswer can narrow the answer
+	// to it (see h264answer.go).
+	var answerCodec *webrtc.RTPCodecParameters
+	if c.Mode == core.ModePassiveConsumer && codec.Name == core.CodecH264 && track.Codec.Name == core.CodecH264 {
+		codec = chooseH264(media, codec, track.Codec)
+		params := answerH264Codec(codec, track.Codec)
+		answerCodec = &params
+	}
 
 	for _, sender := range c.Senders {
 		if sender.Codec == codec {
@@ -83,6 +94,13 @@ func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiv
 		sender.Bind(track)
 	} else {
 		sender.HandleRTP(track)
+	}
+
+	if answerCodec != nil {
+		if c.answerCodecs == nil {
+			c.answerCodecs = map[string]webrtc.RTPCodecParameters{}
+		}
+		c.answerCodecs[media.ID] = *answerCodec
 	}
 
 	c.Senders = append(c.Senders, sender)
