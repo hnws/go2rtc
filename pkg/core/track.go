@@ -103,10 +103,13 @@ func NewSender(media *Media, codec *Codec) *Sender {
 	}
 	s.Input = func(packet *Packet) {
 		s.mu.Lock()
+		// count before handing the packet on: the sender goroutine may
+		// replace its payload (keyframe repair) as soon as it has it
+		n := len(packet.Payload)
 		// unblock write to nil chan - OK, write to closed chan - panic
 		select {
 		case s.buf <- packet:
-			s.Bytes += len(packet.Payload)
+			s.Bytes += n
 			s.Packets++
 		default:
 			s.Drops++

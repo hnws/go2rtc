@@ -16,7 +16,10 @@ const PSMaxSize = 128 // the biggest SPS I've seen is 48 (EZVIZ CS-CV210)
 func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 	depack := &codecs.H264Packet{IsAVC: true}
 
-	sps, pps := GetParameterSet(codec.FmtpLine)
+	// LearnedFmtpLine: a WebRTC source's SDP has no parameter sets, but its
+	// producer may already have seen them in-band (learn.go), so a consumer
+	// joining later can repair its very first keyframe
+	sps, pps := GetParameterSet(LearnedFmtpLine(codec))
 	var ps []byte
 	if len(sps) > 0 && len(pps) > 0 {
 		ps = JoinNALU(sps, pps)

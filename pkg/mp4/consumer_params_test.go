@@ -116,3 +116,21 @@ func TestInitAnnouncedParamsUnchanged(t *testing.T) {
 	init := waitInit(t, ch, 500*time.Millisecond)
 	require.True(t, bytes.Contains(init, pSPS))
 }
+
+// A first keyframe without SPS/PPS (they were sent before the consumer
+// joined) must not end the wait; the next keyframe that carries them does.
+func TestInitSkipsKeyframeWithoutParams(t *testing.T) {
+	_, rx, ch := startConsumer(t, rawH264("packetization-mode=1"))
+
+	rx.WriteRTP(&rtp.Packet{Header: rtp.Header{Timestamp: 1000}, Payload: avcc(pIDR)})
+	select {
+	case <-ch:
+		t.Fatal("init written from a keyframe without parameter sets")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	rx.WriteRTP(&rtp.Packet{Header: rtp.Header{Timestamp: 2000}, Payload: avcc(pSPS, pPPS, pIDR)})
+	init := waitInit(t, ch, 2*time.Second)
+	require.True(t, bytes.Contains(init, pSPS))
+	require.False(t, bytes.Contains(init, dummy))
+}

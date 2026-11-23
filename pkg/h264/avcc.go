@@ -47,7 +47,11 @@ func RepairAVCC(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 				ps = JoinNALU(sps, pps)
 			}
 		case NALUTypeIFrame:
-			packet.Payload = Join(ps, packet.Payload)
+			// repair a copy: the packet is shared with the other senders of
+			// this receiver and must not be written to (race detector)
+			repaired := *packet
+			repaired.Payload = Join(ps, packet.Payload)
+			packet = &repaired
 		}
 		handler(packet)
 	}

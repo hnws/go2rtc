@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,4 +85,19 @@ func TestLearnedFmtpLineUntouched(t *testing.T) {
 	LearnRTP(c, stapA(testSPS, testPPS))
 	ForgetParams(c)
 	require.Equal(t, "packetization-mode=1", LearnedFmtpLine(c), "forgotten")
+}
+
+// RTPDepay of a consumer that joins after the producer learned SPS/PPS repairs
+// a bare first keyframe with them.
+func TestRTPDepaySeedsFromLearned(t *testing.T) {
+	c := &core.Codec{Name: core.CodecH264, ClockRate: 90000, PayloadType: 96, FmtpLine: "packetization-mode=1"}
+	LearnRTP(c, stapA(testSPS, testPPS))
+	defer ForgetParams(c)
+
+	var got []byte
+	h := RTPDepay(c, func(p *rtp.Packet) { got = p.Payload })
+	h(&rtp.Packet{Header: rtp.Header{Marker: true, SequenceNumber: 1, Timestamp: 1}, Payload: []byte{0x65, 0x88, 0x84, 0x04}})
+	require.NotNil(t, got)
+	sps, _ := GetParameterSet(GetFmtpLine(got))
+	require.Equal(t, testSPS, sps, "first keyframe repaired with the learned SPS")
 }

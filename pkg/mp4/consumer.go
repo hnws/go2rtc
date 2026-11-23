@@ -101,13 +101,15 @@ func (c *Consumer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 
 			// important to use Mutex because right fragment order
 			c.mu.Lock()
-			if needParams {
-				needParams = false
+			// a keyframe may arrive without its SPS/PPS (they were sent before
+			// this consumer joined); keep waiting for one that has them
+			if needParams && h264.IsKeyframe(packet.Payload) {
 				if fmtp := h264.GetFmtpLine(packet.Payload); strings.Contains(fmtp, "sprop-parameter-sets=") &&
 					strings.Contains(core.Between(fmtp, "sprop-parameter-sets=", ";"), ",") {
+					needParams = false
 					c.muxer.SetFmtp(int(trackID), fmtp)
+					c.paramsOnce.Do(func() { close(c.paramsReady) })
 				}
-				c.paramsOnce.Do(func() { close(c.paramsReady) })
 			}
 			b := c.muxer.GetPayload(trackID, packet)
 			if n, err := c.wr.Write(b); err == nil {
